@@ -13,9 +13,8 @@ RUN pip install --no-cache-dir \
     runpod \
     websocket-client
 
+# Copy handler and config files first
 WORKDIR /app
-
-# Copy handler and config files
 COPY handler.py .
 COPY entrypoint.sh .
 COPY extra_model_paths.yaml .
@@ -23,8 +22,7 @@ COPY new_Wan22_api.json /new_Wan22_api.json
 COPY new_Wan22_flf2v_api.json /new_Wan22_flf2v_api.json
 RUN chmod +x entrypoint.sh
 
-# Note: ComfyUI should be in /runpod-volume/ComfyUI/
-# Models should be in /runpod-volume/models/
-# These are mounted from RunPod Network Volume
+# Note: ComfyUI and models should be in /runpod-volume/
+# Install ComfyUI requirements at runtime from volume
 
 CMD ["/app/entrypoint.sh"]
