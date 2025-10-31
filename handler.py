@@ -211,6 +211,45 @@ def handler(event):
                 "error": "Missing 'workflow' or 'prompt' in input"
             }
         
+        # Загружаем изображения если они есть
+        if "images" in input_data:
+            images = input_data["images"]
+            print(f"Received {len(images)} images to upload")
+            
+            # Запускаем ComfyUI если еще не запущен
+            handler_instance.start_comfyui()
+            
+            # Загружаем каждое изображение
+            for i, img in enumerate(images):
+                img_name = img.get("name", f"image_{i}.jpg")
+                img_data = img.get("image", "")
+                
+                # Убираем data:image/... prefix если есть
+                if img_data.startswith("data:"):
+                    img_data = img_data.split(",")[1]
+                
+                try:
+                    # Декодируем base64
+                    img_bytes = base64.b64decode(img_data)
+                    
+                    # Загружаем в ComfyUI
+                    files = {"image": (img_name, img_bytes, "image/jpeg")}
+                    data = {"overwrite": "true"}
+                    
+                    upload_response = requests.post(
+                        f"{handler_instance.comfyui_url}/upload/image",
+                        files=files,
+                        data=data
+                    )
+                    
+                    if upload_response.status_code == 200:
+                        print(f"✓ Uploaded image: {img_name}")
+                    else:
+                        print(f"✗ Failed to upload {img_name}: {upload_response.status_code}")
+                        
+                except Exception as e:
+                    print(f"Error uploading image {img_name}: {e}")
+        
         # Обрабатываем workflow
         result = handler_instance.process_comfyui_workflow(workflow_prompt)
         

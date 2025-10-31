@@ -84,9 +84,13 @@ def create_simple_workflow():
     return workflow
 
 
-def process_image(workflow):
+def process_image(workflow, images=None):
     """
     Отправляет workflow в RunPod endpoint и получает результат
+    
+    Args:
+        workflow: dict - ComfyUI workflow
+        images: list (optional) - список изображений в формате [{"name": "filename.jpg", "image": "base64_data"}]
     """
     headers = {
         "Content-Type": "application/json",
@@ -98,6 +102,11 @@ def process_image(workflow):
             "workflow": workflow
         }
     }
+    
+    # Добавляем изображения если они есть
+    if images:
+        payload["input"]["images"] = images
+        print(f"Добавлено {len(images)} изображений для загрузки")
     
     print("Отправка запроса в RunPod...")
     print(f"Endpoint: {ENDPOINT_URL}")
