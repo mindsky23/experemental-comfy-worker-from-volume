@@ -66,17 +66,26 @@ class ComfyUIHandler:
         )
         
         # Ждем, пока ComfyUI запустится
-        for i in range(60):
+        # Увеличено до 600 секунд (10 минут) для больших моделей WAN
+        max_wait_time = 600
+        print(f"Waiting up to {max_wait_time} seconds for ComfyUI to start...")
+        
+        for i in range(max_wait_time):
             try:
                 response = requests.get(f"{self.comfyui_url}/system_stats", timeout=2)
                 if response.status_code == 200:
-                    print("ComfyUI is ready!")
+                    print(f"ComfyUI is ready! (started in {i} seconds)")
                     return
             except:
                 pass
+            
+            # Показываем прогресс каждые 30 секунд
+            if i > 0 and i % 30 == 0:
+                print(f"Waiting for ComfyUI... ({i}/{max_wait_time}s)")
+            
             time.sleep(1)
         
-        raise RuntimeError("ComfyUI failed to start within 60 seconds")
+        raise RuntimeError(f"ComfyUI failed to start within {max_wait_time} seconds")
     
     def queue_prompt(self, prompt):
         """
@@ -107,7 +116,7 @@ class ComfyUIHandler:
         response = requests.get(
             f"{self.comfyui_url}/view",
             params=data,
-            timeout=10
+            timeout=60  # Увеличено для больших файлов
         )
         response.raise_for_status()
         
@@ -134,7 +143,7 @@ class ComfyUIHandler:
             
             # Ждем выполнения
             results = []
-            max_wait = 300  # 5 минут максимум
+            max_wait = 600  # 10 минут для больших видео WAN
             waited = 0
             
             while waited < max_wait:
@@ -239,7 +248,8 @@ def handler(event):
                     upload_response = requests.post(
                         f"{handler_instance.comfyui_url}/upload/image",
                         files=files,
-                        data=data
+                        data=data,
+                        timeout=120  # 2 минуты для больших изображений
                     )
                     
                     if upload_response.status_code == 200:
