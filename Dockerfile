@@ -5,6 +5,9 @@ FROM wlsdml1114/multitalk-base:1.7 as runtime
 RUN pip install -U "huggingface_hub[hf_transfer]"
 RUN pip install runpod websocket-client
 
+# Install curl for health checks
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /
 
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
