@@ -1,280 +1,377 @@
-import os
-import subprocess
-import threading
-import time
-import requests
-import json
-import base64
 import runpod
+import os
+import websocket
+import base64
+import json
+import uuid
+import logging
+import urllib.request
+import urllib.parse
+import binascii # Base64 에러 처리를 위해 import
+import subprocess
+import time
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-class ComfyUIHandler:
-    def __init__(self):
-        self.comfyui_process = None
-        self.comfyui_url = "http://localhost:8188"
-        self.setup_comfyui_paths()
-        
-    def setup_comfyui_paths(self):
-        """
-        Настраивает пути для ComfyUI:
-        В RunPod Serverless volume монтируется в /runpod-volume
-        Структура: /runpod-volume/ComfyUI/main.py и /runpod-volume/models/
-        """
-        # В RunPod Serverless volume монтируется в /runpod-volume
-        # У пользователя структура: /workspace/ComfyUI/ и /workspace/models/
-        runpod_volume = "/runpod-volume"
-        
-        # Определяем путь к ComfyUI
-        # Проверяем структуру: /runpod-volume/ComfyUI/main.py
-        if os.path.exists(f"{runpod_volume}/ComfyUI/main.py"):
-            self.comfyui_path = f"{runpod_volume}/ComfyUI"
-        elif os.path.exists(f"{runpod_volume}/main.py"):
-            # Альтернативная структура: /runpod-volume/main.py
-            self.comfyui_path = runpod_volume
-        else:
-            self.comfyui_path = f"{runpod_volume}/ComfyUI"  # По умолчанию
-        
-        print(f"ComfyUI path: {self.comfyui_path}")
-        
-        # Проверяем наличие main.py
-        if not os.path.exists(f"{self.comfyui_path}/main.py"):
-            print(f"Warning: ComfyUI main.py not found at {self.comfyui_path}")
-        else:
-            print(f"✓ ComfyUI found at {self.comfyui_path}")
-        
-    def start_comfyui(self):
-        """Запускает ComfyUI в фоновом режиме"""
-        if self.comfyui_process and self.comfyui_process.poll() is None:
-            print("ComfyUI already running")
-            return
-        
-        print("Starting ComfyUI...")
-        
-        # Команда для запуска ComfyUI
-        cmd = [
-            "python3",
-            "-u",
-            f"{self.comfyui_path}/main.py"
-        ]
-        
-        self.comfyui_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=self.comfyui_path
-        )
-        
-        # Ждем, пока ComfyUI запустится
-        # Увеличено до 600 секунд (10 минут) для больших моделей WAN
-        max_wait_time = 600
-        print(f"Waiting up to {max_wait_time} seconds for ComfyUI to start...")
-        
-        for i in range(max_wait_time):
-            try:
-                response = requests.get(f"{self.comfyui_url}/system_stats", timeout=2)
-                if response.status_code == 200:
-                    print(f"ComfyUI is ready! (started in {i} seconds)")
-                    return
-            except:
-                pass
-            
-            # Показываем прогресс каждые 30 секунд
-            if i > 0 and i % 30 == 0:
-                print(f"Waiting for ComfyUI... ({i}/{max_wait_time}s)")
-            
-            time.sleep(1)
-        
-        raise RuntimeError(f"ComfyUI failed to start within {max_wait_time} seconds")
-    
-    def queue_prompt(self, prompt):
-        """
-        Отправляет промпт в очередь ComfyUI
-        """
-        p = {"prompt": prompt, "client_id": str(time.time())}
-        
-        response = requests.post(
-            f"{self.comfyui_url}/prompt",
-            json=p
-        )
-        response.raise_for_status()
-        
-        return response.json()
-    
-    def get_history(self, prompt_id):
-        """Получает историю выполнения промпта"""
-        response = requests.get(
-            f"{self.comfyui_url}/history/{prompt_id}"
-        )
-        response.raise_for_status()
-        return response.json()
-    
-    def get_image(self, filename, subfolder="", folder_type="output"):
-        """Загружает изображение из ComfyUI"""
-        data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
-        
-        response = requests.get(
-            f"{self.comfyui_url}/view",
-            params=data,
-            timeout=60  # Увеличено для больших файлов
-        )
-        response.raise_for_status()
-        
-        return response.content
-    
-    def process_comfyui_workflow(self, workflow_prompt):
-        """
-        Обрабатывает workflow ComfyUI и возвращает результаты
-        
-        Результаты сохраняются в:
-        - /runpod-volume/ComfyUI/output/ (в volume, виден в RunPod)
-        - Возвращаются в ответе API как base64
-        """
-        try:
-            # Запускаем ComfyUI если он еще не запущен
-            self.start_comfyui()
-            
-            # Отправляем промпт
-            print("Queuing prompt...")
-            queue_response = self.queue_prompt(workflow_prompt)
-            prompt_id = queue_response["prompt_id"]
-            
-            print(f"Prompt queued with ID: {prompt_id}")
-            
-            # Ждем выполнения
-            results = []
-            max_wait = 600  # 10 минут для больших видео WAN
-            waited = 0
-            
-            while waited < max_wait:
-                time.sleep(2)
-                waited += 2
-                
-                history = self.get_history(prompt_id)
-                
-                if prompt_id in history:
-                    print("Execution completed!")
-                    
-                    # Извлекаем результаты
-                    prompt_outputs = history[prompt_id]["outputs"]
-                    
-                    for node_id in prompt_outputs:
-                        node_output = prompt_outputs[node_id]
-                        
-                        if "images" in node_output:
-                            for image_info in node_output["images"]:
-                                filename = image_info["filename"]
-                                subfolder = image_info.get("subfolder", "")
-                                image_type = image_info.get("type", "output")
-                                
-                                image_data = self.get_image(filename, subfolder, image_type)
-                                
-                                # Кодируем в base64 для передачи
-                                image_base64 = base64.b64encode(image_data).decode()
-                                
-                                results.append({
-                                    "filename": filename,
-                                    "image": image_base64
-                                })
-                    
-                    return {
-                        "status": "completed",
-                        "results": results
-                    }
-                
-                print(f"Waiting for execution... ({waited}s)")
-            
-            return {
-                "status": "timeout",
-                "message": "Execution exceeded maximum wait time"
-            }
-            
-        except Exception as e:
-            print(f"Error processing workflow: {str(e)}")
-            return {
-                "status": "error",
-                "message": str(e)
-            }
-
-
-# Создаем глобальный handler
-handler_instance = ComfyUIHandler()
-
-
-def handler(event):
-    """
-    Основная функция обработчика для RunPod Serverless
-    """
+server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
+client_id = str(uuid.uuid4())
+def to_nearest_multiple_of_16(value):
+    """주어진 값을 가장 가까운 16의 배수로 보정, 최소 16 보장"""
     try:
-        input_data = event.get("input", {})
+        numeric_value = float(value)
+    except Exception:
+        raise Exception(f"width/height 값이 숫자가 아닙니다: {value}")
+    adjusted = int(round(numeric_value / 16.0) * 16)
+    if adjusted < 16:
+        adjusted = 16
+    return adjusted
+def process_input(input_data, temp_dir, output_filename, input_type):
+    """입력 데이터를 처리하여 파일 경로를 반환하는 함수"""
+    if input_type == "path":
+        # 경로인 경우 그대로 반환
+        logger.info(f"📁 경로 입력 처리: {input_data}")
+        return input_data
+    elif input_type == "url":
+        # URL인 경우 다운로드
+        logger.info(f"🌐 URL 입력 처리: {input_data}")
+        os.makedirs(temp_dir, exist_ok=True)
+        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
+        return download_file_from_url(input_data, file_path)
+    elif input_type == "base64":
+        # Base64인 경우 디코딩하여 저장
+        logger.info(f"🔢 Base64 입력 처리")
+        return save_base64_to_file(input_data, temp_dir, output_filename)
+    else:
+        raise Exception(f"지원하지 않는 입력 타입: {input_type}")
+
         
-        # Поддерживаем разные форматы входа
-        if "workflow" in input_data:
-            # Пользователь отправляет готовый workflow
-            workflow_prompt = input_data["workflow"]
-        elif "prompt" in input_data:
-            # Альтернативный формат
-            workflow_prompt = input_data["prompt"]
+def download_file_from_url(url, output_path):
+    """URL에서 파일을 다운로드하는 함수"""
+    try:
+        # wget을 사용하여 파일 다운로드
+        result = subprocess.run([
+            'wget', '-O', output_path, '--no-verbose', url
+        ], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info(f"✅ URL에서 파일을 성공적으로 다운로드했습니다: {url} -> {output_path}")
+            return output_path
         else:
-            return {
-                "error": "Missing 'workflow' or 'prompt' in input"
-            }
+            logger.error(f"❌ wget 다운로드 실패: {result.stderr}")
+            raise Exception(f"URL 다운로드 실패: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        logger.error("❌ 다운로드 시간 초과")
+        raise Exception("다운로드 시간 초과")
+    except Exception as e:
+        logger.error(f"❌ 다운로드 중 오류 발생: {e}")
+        raise Exception(f"다운로드 중 오류 발생: {e}")
+
+
+def save_base64_to_file(base64_data, temp_dir, output_filename):
+    """Base64 데이터를 파일로 저장하는 함수"""
+    try:
+        # Base64 문자열 디코딩
+        decoded_data = base64.b64decode(base64_data)
         
-        # Загружаем изображения если они есть
-        if "images" in input_data:
-            images = input_data["images"]
-            print(f"Received {len(images)} images to upload")
-            
-            # Запускаем ComfyUI если еще не запущен
-            handler_instance.start_comfyui()
-            
-            # Загружаем каждое изображение
-            for i, img in enumerate(images):
-                img_name = img.get("name", f"image_{i}.jpg")
-                img_data = img.get("image", "")
-                
-                # Убираем data:image/... prefix если есть
-                if img_data.startswith("data:"):
-                    img_data = img_data.split(",")[1]
-                
-                try:
-                    # Декодируем base64
-                    img_bytes = base64.b64decode(img_data)
-                    
-                    # Загружаем в ComfyUI
-                    files = {"image": (img_name, img_bytes, "image/jpeg")}
-                    data = {"overwrite": "true"}
-                    
-                    upload_response = requests.post(
-                        f"{handler_instance.comfyui_url}/upload/image",
-                        files=files,
-                        data=data,
-                        timeout=120  # 2 минуты для больших изображений
-                    )
-                    
-                    if upload_response.status_code == 200:
-                        print(f"✓ Uploaded image: {img_name}")
-                    else:
-                        print(f"✗ Failed to upload {img_name}: {upload_response.status_code}")
-                        
-                except Exception as e:
-                    print(f"Error uploading image {img_name}: {e}")
+        # 디렉토리가 존재하지 않으면 생성
+        os.makedirs(temp_dir, exist_ok=True)
         
-        # Обрабатываем workflow
-        result = handler_instance.process_comfyui_workflow(workflow_prompt)
+        # 파일로 저장
+        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
+        with open(file_path, 'wb') as f:
+            f.write(decoded_data)
         
+        logger.info(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
+        return file_path
+    except (binascii.Error, ValueError) as e:
+        logger.error(f"❌ Base64 디코딩 실패: {e}")
+        raise Exception(f"Base64 디코딩 실패: {e}")
+    
+def upload_image_to_comfyui(image_path):
+    """Upload image to ComfyUI server"""
+    try:
+        url = f"http://{server_address}:8188/upload/image"
+        logger.info(f"Uploading image to: {url}")
+        
+        # Читаем файл
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+        
+        # Определяем имя файла
+        filename = os.path.basename(image_path)
+        
+        # Создаем multipart/form-data request
+        boundary = '----WebKitFormBoundary' + str(uuid.uuid4())
+        
+        # Формируем данные
+        body = []
+        body.append(f'--{boundary}'.encode())
+        body.append(f'Content-Disposition: form-data; name="image"; filename="{filename}"'.encode())
+        body.append(b'Content-Type: image/jpeg')
+        body.append(b'')
+        body.append(image_data)
+        body.append(f'--{boundary}--'.encode())
+        body.append(b'')
+        
+        request_body = b'\r\n'.join(body)
+        
+        # Отправляем запрос
+        req = urllib.request.Request(url, data=request_body)
+        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+        
+        response = urllib.request.urlopen(req)
+        result = json.loads(response.read())
+        
+        logger.info(f"✅ Image uploaded successfully: {result}")
         return result
         
     except Exception as e:
-        return {
-            "error": str(e)
-        }
+        logger.error(f"❌ Failed to upload image: {e}")
+        raise Exception(f"Failed to upload image: {e}")
 
+def queue_prompt(prompt):
+    url = f"http://{server_address}:8188/prompt"
+    logger.info(f"Queueing prompt to: {url}")
+    p = {"prompt": prompt, "client_id": client_id}
+    data = json.dumps(p).encode('utf-8')
+    req = urllib.request.Request(url, data=data)
+    return json.loads(urllib.request.urlopen(req).read())
 
-# Запускаем сервер RunPod
-if __name__ == "__main__":
-    print("Starting RunPod Serverless handler...")
-    print("ComfyUI will be started on first request")
+def get_image(filename, subfolder, folder_type):
+    url = f"http://{server_address}:8188/view"
+    logger.info(f"Getting image from: {url}")
+    data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
+    url_values = urllib.parse.urlencode(data)
+    with urllib.request.urlopen(f"{url}?{url_values}") as response:
+        return response.read()
+
+def get_history(prompt_id):
+    url = f"http://{server_address}:8188/history/{prompt_id}"
+    logger.info(f"Getting history from: {url}")
+    with urllib.request.urlopen(url) as response:
+        return json.loads(response.read())
+
+def get_videos(ws, prompt):
+    prompt_id = queue_prompt(prompt)['prompt_id']
+    output_videos = {}
+    while True:
+        out = ws.recv()
+        if isinstance(out, str):
+            message = json.loads(out)
+            if message['type'] == 'executing':
+                data = message['data']
+                if data['node'] is None and data['prompt_id'] == prompt_id:
+                    break
+        else:
+            continue
+
+    history = get_history(prompt_id)[prompt_id]
+    for node_id in history['outputs']:
+        node_output = history['outputs'][node_id]
+        videos_output = []
+        if 'gifs' in node_output:
+            for video in node_output['gifs']:
+                # fullpath를 이용하여 직접 파일을 읽고 base64로 인코딩
+                with open(video['fullpath'], 'rb') as f:
+                    video_data = base64.b64encode(f.read()).decode('utf-8')
+                videos_output.append(video_data)
+        output_videos[node_id] = videos_output
+
+    return output_videos
+
+def load_workflow(workflow_path):
+    with open(workflow_path, 'r') as file:
+        return json.load(file)
+
+def handler(job):
+    job_input = job.get("input", {})
+
+    logger.info(f"Received job input: {job_input}")
+    task_id = f"task_{uuid.uuid4()}"
+
+    # 이미지 입력 처리 - 먼저 images[] 배열 체크, 그 다음 단일 이미지
+    image_path = None
     
-    runpod.serverless.start({"handler": handler})
+    # 새로운 형식: images[] 배열 (우선순위)
+    if "images" in job_input and len(job_input["images"]) > 0:
+        first_image = job_input["images"][0]
+        img_name = first_image.get("name", "input_image.jpg")
+        img_data = first_image.get("image", "")
+        
+        # data:image/... prefix 제거
+        if img_data.startswith("data:"):
+            img_data = img_data.split(",")[1]
+        
+        # Base64 디코딩하여 저장
+        image_path = process_input(img_data, task_id, img_name, "base64")
+        logger.info(f"✅ Processed image from images[] array: {img_name}")
+    
+    # 기존 형식: image_path, image_url, image_base64
+    elif "image_path" in job_input:
+        image_path = process_input(job_input["image_path"], task_id, "input_image.jpg", "path")
+    elif "image_url" in job_input:
+        image_path = process_input(job_input["image_url"], task_id, "input_image.jpg", "url")
+    elif "image_base64" in job_input:
+        image_path = process_input(job_input["image_base64"], task_id, "input_image.jpg", "base64")
+    else:
+        # 기본값 사용
+        image_path = "/example_image.png"
+        logger.info("기본 이미지 파일을 사용합니다: /example_image.png")
 
+    # 엔드 이미지 입력 처리 (end_image_path, end_image_url, end_image_base64 중 하나만 사용)
+    end_image_path_local = None
+    if "end_image_path" in job_input:
+        end_image_path_local = process_input(job_input["end_image_path"], task_id, "end_image.jpg", "path")
+    elif "end_image_url" in job_input:
+        end_image_path_local = process_input(job_input["end_image_url"], task_id, "end_image.jpg", "url")
+    elif "end_image_base64" in job_input:
+        end_image_path_local = process_input(job_input["end_image_base64"], task_id, "end_image.jpg", "base64")
+    
+    # 워크플로우 처리 - 커스텀 workflow가 있으면 사용, 없으면 기본 Wan2.2
+    if "workflow" in job_input:
+        # 커스텀 workflow 사용 (동적 입력)
+        logger.info("✅ Using custom workflow from input")
+        prompt = job_input["workflow"]
+    else:
+        # 기본 Wan2.2 workflow 사용
+        logger.info("Using default Wan2.2 workflow")
+        
+        # LoRA 설정 확인 - 배열로 받아서 처리
+        lora_pairs = job_input.get("lora_pairs", [])
+        
+        # 최대 4개 LoRA까지 지원
+        lora_count = min(len(lora_pairs), 4)
+        if lora_count > len(lora_pairs):
+            logger.warning(f"LoRA 개수가 {len(lora_pairs)}개입니다. 최대 4개까지만 지원됩니다. 처음 4개만 사용합니다.")
+            lora_pairs = lora_pairs[:4]
+        
+        # 워크플로우 파일 선택 (end_image_*가 있으면 FLF2V 워크플로 사용)
+        workflow_file = "/new_Wan22_flf2v_api.json" if end_image_path_local else "/new_Wan22_api.json"
+        logger.info(f"Using {'FLF2V' if end_image_path_local else 'single'} workflow with {lora_count} LoRA pairs")
+        
+        prompt = load_workflow(workflow_file)
+    
+    # 커스텀 workflow가 아닌 경우에만 Wan2.2 파라미터 적용
+    use_custom_workflow = "workflow" in job_input
+    
+    # 커스텀 workflow의 경우 изображение нужно загрузить в ComfyUI
+    if use_custom_workflow and image_path:
+        logger.info(f"Uploading image to ComfyUI: {image_path}")
+        upload_result = upload_image_to_comfyui(image_path)
+        # ComfyUI возвращает: {"name": "filename.jpg", "subfolder": "", "type": "input"}
+        uploaded_filename = upload_result.get("name", os.path.basename(image_path))
+        logger.info(f"✅ Image uploaded as: {uploaded_filename}")
+        # Пользователь сам указывает в своем workflow куда нужно подставить
+        # Мы просто загрузили файл, теперь он доступен в ComfyUI
+        
+    if not use_custom_workflow:
+        length = job_input.get("length", 81)
+        steps = job_input.get("steps", 10)
+
+        prompt["244"]["inputs"]["image"] = image_path
+        prompt["541"]["inputs"]["num_frames"] = length
+        prompt["135"]["inputs"]["positive_prompt"] = job_input["prompt"]
+        prompt["220"]["inputs"]["seed"] = job_input["seed"]
+        prompt["540"]["inputs"]["seed"] = job_input["seed"]
+        prompt["540"]["inputs"]["cfg"] = job_input["cfg"]
+        # 해상도(폭/높이) 16배수 보정
+        original_width = job_input["width"]
+        original_height = job_input["height"]
+        adjusted_width = to_nearest_multiple_of_16(original_width)
+        adjusted_height = to_nearest_multiple_of_16(original_height)
+        if adjusted_width != original_width:
+            logger.info(f"Width adjusted to nearest multiple of 16: {original_width} -> {adjusted_width}")
+        if adjusted_height != original_height:
+            logger.info(f"Height adjusted to nearest multiple of 16: {original_height} -> {adjusted_height}")
+        prompt["235"]["inputs"]["value"] = adjusted_width
+        prompt["236"]["inputs"]["value"] = adjusted_height
+        prompt["498"]["inputs"]["context_overlap"] = job_input.get("context_overlap", 48)
+        
+        # step 설정 적용
+        if "834" in prompt:
+            prompt["834"]["inputs"]["steps"] = steps
+            logger.info(f"Steps set to: {steps}")
+            lowsteps = int(steps*0.6)
+            prompt["829"]["inputs"]["step"] = lowsteps
+            logger.info(f"LowSteps set to: {lowsteps}")
+
+        # 엔드 이미지가 있는 경우 617번 노드에 경로 적용 (FLF2V 전용)
+        if end_image_path_local:
+            prompt["617"]["inputs"]["image"] = end_image_path_local
+        
+        # LoRA 설정 적용 - HIGH LoRA는 노드 279, LOW LoRA는 노드 553
+        if lora_count > 0:
+            # HIGH LoRA 노드 (279번)
+            high_lora_node_id = "279"
+            
+            # LOW LoRA 노드 (553번)
+            low_lora_node_id = "553"
+            
+            # 입력받은 LoRA pairs 적용 (lora_1부터 시작)
+            for i, lora_pair in enumerate(lora_pairs):
+                if i < 4:  # 최대 4개까지만
+                    lora_high = lora_pair.get("high")
+                    lora_low = lora_pair.get("low")
+                    lora_high_weight = lora_pair.get("high_weight", 1.0)
+                    lora_low_weight = lora_pair.get("low_weight", 1.0)
+                    
+                    # HIGH LoRA 설정 (노드 279번, lora_1부터 시작)
+                    if lora_high:
+                        prompt[high_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_high
+                        prompt[high_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_high_weight
+                        logger.info(f"LoRA {i+1} HIGH applied to node 279: {lora_high} with weight {lora_high_weight}")
+                    
+                    # LOW LoRA 설정 (노드 553번, lora_1부터 시작)
+                    if lora_low:
+                        prompt[low_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_low
+                        prompt[low_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_low_weight
+                        logger.info(f"LoRA {i+1} LOW applied to node 553: {lora_low} with weight {lora_low_weight}")
+
+    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
+    logger.info(f"Connecting to WebSocket: {ws_url}")
+    
+    # 먼저 HTTP 연결이 가능한지 확인
+    http_url = f"http://{server_address}:8188/"
+    logger.info(f"Checking HTTP connection to: {http_url}")
+    
+    # HTTP 연결 확인 (최대 1분)
+    max_http_attempts = 180
+    for http_attempt in range(max_http_attempts):
+        try:
+            import urllib.request
+            response = urllib.request.urlopen(http_url, timeout=5)
+            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
+            break
+        except Exception as e:
+            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
+            if http_attempt == max_http_attempts - 1:
+                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
+            time.sleep(1)
+    
+    ws = websocket.WebSocket()
+    # 웹소켓 연결 시도 (최대 3분)
+    max_attempts = int(180/5)  # 3분 (1초에 한 번씩 시도)
+    for attempt in range(max_attempts):
+        import time
+        try:
+            ws.connect(ws_url)
+            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
+            break
+        except Exception as e:
+            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
+            if attempt == max_attempts - 1:
+                raise Exception("웹소켓 연결 시간 초과 (3분)")
+            time.sleep(5)
+    videos = get_videos(ws, prompt)
+    ws.close()
+
+    # 이미지가 없는 경우 처리
+    for node_id in videos:
+        if videos[node_id]:
+            return {"video": videos[node_id][0]}
+    
+    return {"error": "비디오를를 찾을 수 없습니다."}
+
+runpod.serverless.start({"handler": handler})
