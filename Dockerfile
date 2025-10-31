@@ -1,4 +1,4 @@
-# Используем базовый образ с Python и CUDA
+# Используем базовый образ с Python
 FROM python:3.11-slim
 
 # Устанавливаем необходимые системные зависимости
@@ -15,12 +15,7 @@ WORKDIR /app
 # Копируем requirements.txt
 COPY requirements.txt .
 
-# Устанавливаем PyTorch с CUDA первым (для оптимизации кэша)
-RUN pip install --no-cache-dir \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121
-
-# Устанавливаем остальные зависимости
+# Устанавливаем только минимальные зависимости (ComfyUI установит остальное сам)
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем handler
