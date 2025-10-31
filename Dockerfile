@@ -1,5 +1,5 @@
-# Use Python base image
-FROM python:3.11-slim
+# Use base image with ComfyUI dependencies pre-installed
+FROM wlsdml1114/multitalk-base:1.7
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
