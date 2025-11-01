@@ -9,9 +9,22 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
+# Install PyTorch with CUDA first
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install other dependencies
 RUN pip install --no-cache-dir \
     runpod \
-    websocket-client
+    websocket-client \
+    safetensors \
+    pillow \
+    numpy \
+    requests \
+    aiohttp \
+    psutil \
+    pynvml \
+    accelerate \
+    transformers
 
 # Copy handler and config files first
 WORKDIR /app
